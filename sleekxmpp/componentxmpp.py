@@ -15,17 +15,14 @@
 from __future__ import absolute_import
 
 import logging
-import base64
 import sys
 import hashlib
 
-from sleekxmpp import plugins
-from sleekxmpp import stanza
 from sleekxmpp.basexmpp import BaseXMPP
-from sleekxmpp.xmlstream import XMLStream, RestartStream
-from sleekxmpp.xmlstream import StanzaBase, ET
-from sleekxmpp.xmlstream.matcher import *
-from sleekxmpp.xmlstream.handler import *
+from sleekxmpp.xmlstream import XMLStream
+from sleekxmpp.xmlstream import ET
+from sleekxmpp.xmlstream.matcher import MatchXPath
+from sleekxmpp.xmlstream.handler import Callback
 
 
 log = logging.getLogger(__name__)
@@ -43,8 +40,8 @@ class ComponentXMPP(BaseXMPP):
     :param host: The server accepting the component.
     :param port: The port used to connect to the server.
     :param plugin_config: A dictionary of plugin configurations.
-    :param plugin_whitelist: A list of approved plugins that 
-                    will be loaded when calling 
+    :param plugin_whitelist: A list of approved plugins that
+                    will be loaded when calling
                     :meth:`~sleekxmpp.basexmpp.BaseXMPP.register_plugins()`.
     :param use_jc_ns: Indicates if the ``'jabber:client'`` namespace
                       should be used instead of the standard
@@ -81,8 +78,8 @@ class ComponentXMPP(BaseXMPP):
         self.add_event_handler('presence_probe',
                                self._handle_probe)
 
-    def connect(self, host=None, port=None, use_ssl=False, 
-                      use_tls=True, reattempt=True):
+    def connect(self, host=None, port=None, use_ssl=False,
+                      use_tls=False, reattempt=True):
         """Connect to the server.
 
         Setting ``reattempt`` to ``True`` will cause connection attempts to
@@ -104,10 +101,16 @@ class ComponentXMPP(BaseXMPP):
             host = self.server_host
         if port is None:
             port = self.server_port
+
+        self.server_name = self.boundjid.host
+
+        if use_tls:
+            log.info("XEP-0114 components can not use TLS")
+
         log.debug("Connecting to %s:%s", host, port)
         return XMLStream.connect(self, host=host, port=port,
                                        use_ssl=use_ssl,
-                                       use_tls=use_tls,
+                                       use_tls=False,
                                        reattempt=reattempt)
 
     def incoming_filter(self, xml):
@@ -153,10 +156,10 @@ class ComponentXMPP(BaseXMPP):
 
         :param xml: The reply handshake stanza.
         """
+        self.session_bind_event.set()
         self.session_started_event.set()
+        self.event("session_bind", self.boundjid, direct=True)
         self.event("session_start")
 
-    def _handle_probe(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_probe(presence)
+    def _handle_probe(self, pres):
+        self.roster[pres['to']][pres['from']].handle_probe(pres)

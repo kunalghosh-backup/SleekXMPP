@@ -12,25 +12,26 @@ from sleekxmpp.stanza import Message
 from sleekxmpp.xmlstream import register_stanza_plugin
 from sleekxmpp.xmlstream.handler import Callback
 from sleekxmpp.xmlstream.matcher import StanzaPath
-from sleekxmpp.plugins.base import base_plugin
+from sleekxmpp.plugins import BasePlugin
 from sleekxmpp.plugins.xep_0224 import stanza
 
 
 log = logging.getLogger(__name__)
 
 
-class xep_0224(base_plugin):
+class XEP_0224(BasePlugin):
 
     """
     XEP-0224: Attention
     """
 
+    name = 'xep_0224'
+    description = 'XEP-0224: Attention'
+    dependencies = set(['xep_0030'])
+    stanza = stanza
+
     def plugin_init(self):
         """Start the XEP-0224 plugin."""
-        self.xep = '0224'
-        self.description = 'Attention'
-        self.stanza = stanza
-
         register_stanza_plugin(Message, stanza.Attention)
 
         self.xmpp.register_handler(
@@ -38,9 +39,11 @@ class xep_0224(base_plugin):
                     StanzaPath('message/attention'),
                     self._handle_attention))
 
-    def post_init(self):
-        """Handle cross-plugin dependencies."""
-        base_plugin.post_init(self)
+    def plugin_end(self):
+        self.xmpp['xep_0030'].del_feature(feature=stanza.Attention.namespace)
+        self.xmpp.remove_handler('Attention')
+
+    def session_bind(self, jid):
         self.xmpp['xep_0030'].add_feature(stanza.Attention.namespace)
 
     def request_attention(self, to, mfrom=None, mbody=''):

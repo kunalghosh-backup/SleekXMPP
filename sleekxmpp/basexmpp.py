@@ -15,22 +15,27 @@
 from __future__ import with_statement, unicode_literals
 
 import sys
-import copy
 import logging
+import threading
 
 import sleekxmpp
-from sleekxmpp import plugins, roster
+from sleekxmpp import plugins, features, roster
+from sleekxmpp.api import APIRegistry
 from sleekxmpp.exceptions import IqError, IqTimeout
 
-from sleekxmpp.stanza import Message, Presence, Iq, Error, StreamError
+from sleekxmpp.stanza import Message, Presence, Iq, StreamError
 from sleekxmpp.stanza.roster import Roster
 from sleekxmpp.stanza.nick import Nick
 from sleekxmpp.stanza.htmlim import HTMLIM
 
-from sleekxmpp.xmlstream import XMLStream, JID, tostring
+from sleekxmpp.xmlstream import XMLStream, JID
 from sleekxmpp.xmlstream import ET, register_stanza_plugin
-from sleekxmpp.xmlstream.matcher import *
-from sleekxmpp.xmlstream.handler import *
+from sleekxmpp.xmlstream.matcher import MatchXPath
+from sleekxmpp.xmlstream.handler import Callback
+from sleekxmpp.xmlstream.stanzabase import XML_NS
+
+from sleekxmpp.features import *
+from sleekxmpp.plugins import PluginManager, register_plugin, load_plugin
 
 
 log = logging.getLogger(__name__)
@@ -63,11 +68,25 @@ class BaseXMPP(XMLStream):
         #: An identifier for the stream as given by the server.
         self.stream_id = None
 
-        #: The JabberID (JID) used by this connection. 
+        #: The JabberID (JID) requested for this connection.
+        self.requested_jid = JID(jid)
+
+        #: The JabberID (JID) used by this connection,
+        #: as set after session binding. This may even be a
+        #: different bare JID than what was requested.
         self.boundjid = JID(jid)
 
+        self._expected_server_name = self.boundjid.host
+        self._redirect_attempts = 0
+
+        #: The maximum number of consecutive see-other-host
+        #: redirections that will be followed before quitting.
+        self.max_redirects = 5
+
+        self.session_bind_event = threading.Event()
+
         #: A dictionary mapping plugin names to plugins.
-        self.plugin = {}
+        self.plugin = PluginManager(self)
 
         #: Configuration options for whitelisted plugins.
         #: If a plugin is registered without any configuration,
@@ -82,18 +101,45 @@ class BaseXMPP(XMLStream):
         #: owner JIDs, as in the case for components. For clients
         #: which only have a single JID, see :attr:`client_roster`.
         self.roster = roster.Roster(self)
-        self.roster.add(self.boundjid.bare)
+        self.roster.add(self.boundjid)
 
         #: The single roster for the bound JID. This is the
         #: equivalent of::
         #:
         #:     self.roster[self.boundjid.bare]
-        self.client_roster = self.roster[self.boundjid.bare]
+        self.client_roster = self.roster[self.boundjid]
 
         #: The distinction between clients and components can be
         #: important, primarily for choosing how to handle the
         #: ``'to'`` and ``'from'`` JIDs of stanzas.
         self.is_component = False
+
+        #: Messages may optionally be tagged with ID values. Setting
+        #: :attr:`use_message_ids` to `True` will assign all outgoing
+        #: messages an ID. Some plugin features require enabling
+        #: this option.
+        self.use_message_ids = False
+
+        #: Presence updates may optionally be tagged with ID values.
+        #: Setting :attr:`use_message_ids` to `True` will assign all
+        #: outgoing messages an ID.
+        self.use_presence_ids = False
+
+        #: The API registry is a way to process callbacks based on
+        #: JID+node combinations. Each callback in the registry is
+        #: marked with:
+        #:
+        #:   - An API name, e.g. xep_0030
+        #:   - The name of an action, e.g. get_info
+        #:   - The JID that will be affected
+        #:   - The node that will be affected
+        #:
+        #: API handlers with no JID or node will act as global handlers,
+        #: while those with a JID and no node will service all nodes
+        #: for a JID, and handlers with both a JID and node will be
+        #: used only for that specific combination. The handler that
+        #: provides the most specificity will be used.
+        self.api = APIRegistry(self)
 
         #: Flag indicating that the initial presence broadcast has
         #: been sent. Until this happens, some servers may not
@@ -113,11 +159,14 @@ class BaseXMPP(XMLStream):
             Callback('Presence',
                      MatchXPath("{%s}presence" % self.default_ns),
                      self._handle_presence))
+
         self.register_handler(
             Callback('Stream Error',
                      MatchXPath("{%s}error" % self.stream_ns),
                      self._handle_stream_error))
 
+        self.add_event_handler('session_start',
+                               self._handle_session_start)
         self.add_event_handler('disconnected',
                                self._handle_disconnected)
         self.add_event_handler('presence_available',
@@ -160,6 +209,8 @@ class BaseXMPP(XMLStream):
         :param xml: The incoming stream's root element.
         """
         self.stream_id = xml.get('id', '')
+        self.stream_version = xml.get('version', '')
+        self.peer_default_lang = xml.get('{%s}lang' % XML_NS, None)
 
     def process(self, *args, **kwargs):
         """Initialize plugins and begin processing the XML stream.
@@ -179,7 +230,7 @@ class BaseXMPP(XMLStream):
                     Defaults to ``True``. This does **not** mean that no
                     threads are used at all if ``threaded=False``.
 
-        Regardless of these threading options, these threads will 
+        Regardless of these threading options, these threads will
         always exist:
 
         - The event queue processor
@@ -187,8 +238,10 @@ class BaseXMPP(XMLStream):
         - The scheduler
         """
         for name in self.plugin:
-            if not self.plugin[name].post_inited:
-                self.plugin[name].post_init()
+            if not hasattr(self.plugin[name], 'post_inited'):
+                if hasattr(self.plugin[name], 'post_init'):
+                    self.plugin[name].post_init()
+                self.plugin[name].post_inited = True
         return XMLStream.process(self, *args, **kwargs)
 
     def register_plugin(self, plugin, pconfig={}, module=None):
@@ -201,42 +254,14 @@ class BaseXMPP(XMLStream):
         :param module: Optional refence to the module containing the plugin
                        class if using custom plugins.
         """
-        try:
-            # Import the given module that contains the plugin.
-            if not module:
-                try:
-                    module = sleekxmpp.plugins
-                    module = __import__(
-                            str("%s.%s" % (module.__name__, plugin)),
-                            globals(), locals(), [str(plugin)])
-                except ImportError:
-                    module = sleekxmpp.features
-                    module = __import__(
-                            str("%s.%s" % (module.__name__, plugin)),
-                            globals(), locals(), [str(plugin)])
-            if isinstance(module, str):
-                # We probably want to load a module from outside
-                # the sleekxmpp package, so leave out the globals().
-                module = __import__(module, fromlist=[plugin])
 
-            # Use the global plugin config cache, if applicable
-            if not pconfig:
-                pconfig = self.plugin_config.get(plugin, {})
+        # Use the global plugin config cache, if applicable
+        if not pconfig:
+            pconfig = self.plugin_config.get(plugin, {})
 
-            # Load the plugin class from the module.
-            self.plugin[plugin] = getattr(module, plugin)(self, pconfig)
-
-            # Let XEP/RFC implementing plugins have some extra logging info.
-            spec = '(CUSTOM) %s'
-            if self.plugin[plugin].xep:
-                spec = "(XEP-%s) " % self.plugin[plugin].xep
-            elif self.plugin[plugin].rfc:
-                spec = "(RFC-%s) " % self.plugin[plugin].rfc
-
-            desc = (spec, self.plugin[plugin].description)
-            log.debug("Loaded Plugin %s %s" % desc)
-        except:
-            log.exception("Unable to load plugin: %s", plugin)
+        if not self.plugin.registered(plugin):
+            load_plugin(plugin, module)
+        self.plugin.enable(plugin, pconfig)
 
     def register_plugins(self):
         """Register and initialize all built-in plugins.
@@ -253,14 +278,9 @@ class BaseXMPP(XMLStream):
 
         for plugin in plugin_list:
             if plugin in plugins.__all__:
-                self.register_plugin(plugin,
-                                     self.plugin_config.get(plugin, {}))
+                self.register_plugin(plugin)
             else:
                 raise NameError("Plugin %s not in plugins.__all__." % plugin)
-
-        # Resolve plugin inter-dependencies.
-        for plugin in self.plugin:
-            self.plugin[plugin].post_init()
 
     def __getitem__(self, key):
         """Return a plugin given its name, if it has been registered."""
@@ -276,7 +296,9 @@ class BaseXMPP(XMLStream):
 
     def Message(self, *args, **kwargs):
         """Create a Message stanza associated with this stream."""
-        return Message(self, *args, **kwargs)
+        msg = Message(self, *args, **kwargs)
+        msg['lang'] = self.default_lang
+        return msg
 
     def Iq(self, *args, **kwargs):
         """Create an Iq stanza associated with this stream."""
@@ -284,18 +306,20 @@ class BaseXMPP(XMLStream):
 
     def Presence(self, *args, **kwargs):
         """Create a Presence stanza associated with this stream."""
-        return Presence(self, *args, **kwargs)
+        pres = Presence(self, *args, **kwargs)
+        pres['lang'] = self.default_lang
+        return pres
 
     def make_iq(self, id=0, ifrom=None, ito=None, itype=None, iquery=None):
         """Create a new Iq stanza with a given Id and from JID.
 
         :param id: An ideally unique ID value for this stanza thread.
                    Defaults to 0.
-        :param ifrom: The from :class:`~sleekxmpp.xmlstream.jid.JID` 
+        :param ifrom: The from :class:`~sleekxmpp.xmlstream.jid.JID`
                       to use for this stanza.
         :param ito: The destination :class:`~sleekxmpp.xmlstream.jid.JID`
                     for this stanza.
-        :param itype: The :class:`~sleekxmpp.stanza.iq.Iq`'s type, 
+        :param itype: The :class:`~sleekxmpp.stanza.iq.Iq`'s type,
                       one of: ``'get'``, ``'set'``, ``'result'``,
                       or ``'error'``.
         :param iquery: Optional namespace for adding a query element.
@@ -333,7 +357,7 @@ class BaseXMPP(XMLStream):
 
     def make_iq_result(self, id=None, ito=None, ifrom=None, iq=None):
         """
-        Create an :class:`~sleekxmpp.stanza.iq.Iq` stanza of type 
+        Create an :class:`~sleekxmpp.stanza.iq.Iq` stanza of type
         ``'result'`` with the given ID value.
 
         :param id: An ideally unique ID value. May use :meth:`new_id()`.
@@ -363,10 +387,10 @@ class BaseXMPP(XMLStream):
         Optionally, a substanza may be given to use as the
         stanza's payload.
 
-        :param sub: Either an 
+        :param sub: Either an
                     :class:`~sleekxmpp.xmlstream.stanzabase.ElementBase`
                     stanza object or an
-                    :class:`~xml.etree.ElementTree.Element` XML object 
+                    :class:`~xml.etree.ElementTree.Element` XML object
                     to use as the :class:`~sleekxmpp.stanza.iq.Iq`'s payload.
         :param ito: The destination :class:`~sleekxmpp.xmlstream.jid.JID`
                     for this stanza.
@@ -393,9 +417,9 @@ class BaseXMPP(XMLStream):
         Create an :class:`~sleekxmpp.stanza.iq.Iq` stanza of type ``'error'``.
 
         :param id: An ideally unique ID value. May use :meth:`new_id()`.
-        :param type: The type of the error, such as ``'cancel'`` or 
+        :param type: The type of the error, such as ``'cancel'`` or
                      ``'modify'``. Defaults to ``'cancel'``.
-        :param condition: The error condition. Defaults to 
+        :param condition: The error condition. Defaults to
                           ``'feature-not-implemented'``.
         :param text: A message describing the cause of the error.
         :param ito: The destination :class:`~sleekxmpp.xmlstream.jid.JID`
@@ -419,7 +443,7 @@ class BaseXMPP(XMLStream):
 
     def make_iq_query(self, iq=None, xmlns='', ito=None, ifrom=None):
         """
-        Create or modify an :class:`~sleekxmpp.stanza.iq.Iq` stanza 
+        Create or modify an :class:`~sleekxmpp.stanza.iq.Iq` stanza
         to use the given query namespace.
 
         :param iq: Optionally use an existing stanza instead
@@ -452,7 +476,7 @@ class BaseXMPP(XMLStream):
     def make_message(self, mto, mbody=None, msubject=None, mtype=None,
                      mhtml=None, mfrom=None, mnick=None):
         """
-        Create and initialize a new 
+        Create and initialize a new
         :class:`~sleekxmpp.stanza.message.Message` stanza.
 
         :param mto: The recipient of the message.
@@ -478,7 +502,7 @@ class BaseXMPP(XMLStream):
     def make_presence(self, pshow=None, pstatus=None, ppriority=None,
                       pto=None, ptype=None, pfrom=None, pnick=None):
         """
-        Create and initialize a new 
+        Create and initialize a new
         :class:`~sleekxmpp.stanza.presence.Presence` stanza.
 
         :param pshow: The presence's show value.
@@ -502,7 +526,7 @@ class BaseXMPP(XMLStream):
     def send_message(self, mto, mbody, msubject=None, mtype=None,
                      mhtml=None, mfrom=None, mnick=None):
         """
-        Create, initialize, and send a new 
+        Create, initialize, and send a new
         :class:`~sleekxmpp.stanza.message.Message` stanza.
 
         :param mto: The recipient of the message.
@@ -522,7 +546,7 @@ class BaseXMPP(XMLStream):
     def send_presence(self, pshow=None, pstatus=None, ppriority=None,
                       pto=None, pfrom=None, ptype=None, pnick=None):
         """
-        Create, initialize, and send a new 
+        Create, initialize, and send a new
         :class:`~sleekxmpp.stanza.presence.Presence` stanza.
 
         :param pshow: The presence's show value.
@@ -533,23 +557,13 @@ class BaseXMPP(XMLStream):
         :param pfrom: The sender of the presence.
         :param pnick: Optional nickname of the presence's sender.
         """
-        # Python2.6 chokes on Unicode strings for dict keys.
-        args = {str('pto'): pto,
-                str('ptype'): ptype,
-                str('pshow'): pshow,
-                str('pstatus'): pstatus,
-                str('ppriority'): ppriority,
-                str('pnick'): pnick}
-
-        if self.is_component:
-            self.roster[pfrom].send_presence(**args)
-        else:
-            self.client_roster.send_presence(**args)
+        self.make_presence(pshow, pstatus, ppriority, pto,
+                           ptype, pfrom, pnick).send()
 
     def send_presence_subscription(self, pto, pfrom=None,
                                    ptype='subscribe', pnick=None):
         """
-        Create, initialize, and send a new 
+        Create, initialize, and send a new
         :class:`~sleekxmpp.stanza.presence.Presence` stanza of
         type ``'subscribe'``.
 
@@ -558,14 +572,10 @@ class BaseXMPP(XMLStream):
         :param ptype: The type of presence, such as ``'subscribe'``.
         :param pnick: Optional nickname of the presence's sender.
         """
-        presence = self.makePresence(ptype=ptype,
-                                     pfrom=pfrom,
-                                     pto=self.getjidbare(pto))
-        if pnick:
-            nick = ET.Element('{http://jabber.org/protocol/nick}nick')
-            nick.text = pnick
-            presence.append(nick)
-        presence.send()
+        self.make_presence(ptype=ptype,
+                           pfrom=pfrom,
+                           pto=JID(pto).bare,
+                           pnick=pnick).send()
 
     @property
     def jid(self):
@@ -597,7 +607,7 @@ class BaseXMPP(XMLStream):
 
     @resource.setter
     def resource(self, value):
-        log.warning("fulljid property deprecated. Use boundjid.full")
+        log.warning("fulljid property deprecated. Use boundjid.resource")
         self.boundjid.resource = value
 
     @property
@@ -662,28 +672,61 @@ class BaseXMPP(XMLStream):
     def getjidbare(self, fulljid):
         return fulljid.split('/', 1)[0]
 
+    def _handle_session_start(self, event):
+        """Reset redirection attempt count."""
+        self._redirect_attempts = 0
+
     def _handle_disconnected(self, event):
         """When disconnected, reset the roster"""
         self.roster.reset()
+        self.session_bind_event.clear()
 
     def _handle_stream_error(self, error):
         self.event('stream_error', error)
 
+        if error['condition'] == 'see-other-host':
+            other_host = error['see_other_host']
+            if not other_host:
+                log.warning("No other host specified.")
+                return
+
+            if self._redirect_attempts > self.max_redirects:
+                log.error("Exceeded maximum number of redirection attempts.")
+                return
+
+            self._redirect_attempts += 1
+
+            host = other_host
+            port = 5222
+
+            if '[' in other_host and ']' in other_host:
+                host = other_host.split(']')[0][1:]
+            elif ':' in other_host:
+                host = other_host.split(':')[0]
+
+            port_sec = other_host.split(']')[-1]
+            if ':' in port_sec:
+                port = int(port_sec.split(':')[1])
+
+            self.address = (host, port)
+            self.default_domain = host
+            self.dns_records = None
+            self.reconnect_delay = None
+            self.reconnect()
+
     def _handle_message(self, msg):
         """Process incoming message stanzas."""
+        if not self.is_component and not msg['to'].bare:
+            msg['to'] = self.boundjid
         self.event('message', msg)
 
-    def _handle_available(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_available(presence)
+    def _handle_available(self, pres):
+        self.roster[pres['to']][pres['from']].handle_available(pres)
 
-    def _handle_unavailable(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_unavailable(presence)
+    def _handle_unavailable(self, pres):
+        self.roster[pres['to']][pres['from']].handle_unavailable(pres)
 
-    def _handle_new_subscription(self, stanza):
+    def _handle_new_subscription(self, pres):
         """Attempt to automatically handle subscription requests.
 
         Subscriptions will be approved if the request is from
@@ -695,8 +738,8 @@ class BaseXMPP(XMLStream):
         If a subscription is accepted, a request for a mutual
         subscription will be sent if :attr:`auto_subscribe` is ``True``.
         """
-        roster = self.roster[stanza['to'].bare]
-        item = self.roster[stanza['to'].bare][stanza['from'].bare]
+        roster = self.roster[pres['to']]
+        item = self.roster[pres['to']][pres['from']]
         if item['whitelisted']:
             item.authorize()
         elif roster.auto_authorize:
@@ -706,37 +749,31 @@ class BaseXMPP(XMLStream):
         elif roster.auto_authorize == False:
             item.unauthorize()
 
-    def _handle_removed_subscription(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].unauthorize()
+    def _handle_removed_subscription(self, pres):
+        self.roster[pres['to']][pres['from']].handle_unauthorize(pres)
 
-    def _handle_subscribe(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_subscribe(presence)
+    def _handle_subscribe(self, pres):
+        self.roster[pres['to']][pres['from']].handle_subscribe(pres)
 
-    def _handle_subscribed(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_subscribed(presence)
+    def _handle_subscribed(self, pres):
+        self.roster[pres['to']][pres['from']].handle_subscribed(pres)
 
-    def _handle_unsubscribe(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_unsubscribe(presence)
+    def _handle_unsubscribe(self, pres):
+        self.roster[pres['to']][pres['from']].handle_unsubscribe(pres)
 
-    def _handle_unsubscribed(self, presence):
-        pto = presence['to'].bare
-        pfrom = presence['from'].bare
-        self.roster[pto][pfrom].handle_unsubscribed(presence)
+    def _handle_unsubscribed(self, pres):
+        self.roster[pres['to']][pres['from']].handle_unsubscribed(pres)
 
     def _handle_presence(self, presence):
         """Process incoming presence stanzas.
 
         Update the roster with presence information.
         """
-        self.event("presence_%s" % presence['type'], presence)
+        if not self.is_component and not presence['to'].bare:
+            presence['to'] = self.boundjid
+
+        self.event('presence', presence)
+        self.event('presence_%s' % presence['type'], presence)
 
         # Check for changes in subscription state.
         if presence['type'] in ('subscribe', 'subscribed',
@@ -748,7 +785,7 @@ class BaseXMPP(XMLStream):
             return
 
     def exception(self, exception):
-        """Process any uncaught exceptions, notably 
+        """Process any uncaught exceptions, notably
         :class:`~sleekxmpp.exceptions.IqError` and
         :class:`~sleekxmpp.exceptions.IqTimeout` exceptions.
 
@@ -763,6 +800,11 @@ class BaseXMPP(XMLStream):
             iq = exception.iq
             log.error('Request timed out: %s', iq)
             log.warning('You should catch IqTimeout exceptions')
+        elif isinstance(exception, SyntaxError):
+            # Hide stream parsing errors that occur when the
+            # stream is disconnected (they've been handled, we
+            # don't need to make a mess in the logs).
+            pass
         else:
             log.exception(exception)
 

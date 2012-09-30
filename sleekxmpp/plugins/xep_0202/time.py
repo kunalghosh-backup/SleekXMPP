@@ -12,7 +12,7 @@ from sleekxmpp.stanza.iq import Iq
 from sleekxmpp.xmlstream import register_stanza_plugin
 from sleekxmpp.xmlstream.handler import Callback
 from sleekxmpp.xmlstream.matcher import StanzaPath
-from sleekxmpp.plugins.base import base_plugin
+from sleekxmpp.plugins import BasePlugin
 from sleekxmpp.plugins import xep_0082
 from sleekxmpp.plugins.xep_0202 import stanza
 
@@ -20,27 +20,33 @@ from sleekxmpp.plugins.xep_0202 import stanza
 log = logging.getLogger(__name__)
 
 
-class xep_0202(base_plugin):
+class XEP_0202(BasePlugin):
 
     """
     XEP-0202: Entity Time
     """
 
+    name = 'xep_0202'
+    description = 'XEP-0202: Entity Time'
+    dependencies = set(['xep_0030', 'xep_0082'])
+    stanza = stanza
+    default_config = {
+        #: As a default, respond to time requests with the
+        #: local time returned by XEP-0082. However, a
+        #: custom function can be supplied which accepts
+        #: the JID of the entity to query for the time.
+        'local_time': None,
+        'tz_offset': 0
+    }
+
     def plugin_init(self):
         """Start the XEP-0203 plugin."""
-        self.xep = '0202'
-        self.description = 'Entity Time'
-        self.stanza = stanza
 
-        self.tz_offset = self.config.get('tz_offset', 0)
-
-        # As a default, respond to time requests with the
-        # local time returned by XEP-0082. However, a
-        # custom function can be supplied which accepts
-        # the JID of the entity to query for the time.
-        self.local_time = self.config.get('local_time', None)
         if not self.local_time:
-            self.local_time = lambda x: xep_0082.datetime(offset=self.tz_offset)
+            def default_local_time(jid):
+                return xep_0082.datetime(offset=self.tz_offset)
+
+            self.local_time = default_local_time
 
         self.xmpp.registerHandler(
             Callback('Entity Time',
@@ -48,11 +54,12 @@ class xep_0202(base_plugin):
                  self._handle_time_request))
         register_stanza_plugin(Iq, stanza.EntityTime)
 
-    def post_init(self):
-        """Handle cross-plugin interactions."""
-        base_plugin.post_init(self)
-        self.xmpp['xep_0030'].add_feature('urn:xmpp:time')
+    def plugin_end(self):
+        self.xmpp['xep_0030'].del_feature(feature='urn:xmpp:time')
+        self.xmpp.remove_handler('Entity Time')
 
+    def session_bind(self, jid):
+        self.xmpp['xep_0030'].add_feature('urn:xmpp:time')
 
     def _handle_time_request(self, iq):
         """

@@ -1,7 +1,7 @@
 from sleekxmpp.test import *
 from sleekxmpp.stanza import Message
 from sleekxmpp.xmlstream.stanzabase import ET, ElementBase
-from sleekxmpp.xmlstream.tostring import tostring, xml_escape
+from sleekxmpp.xmlstream.tostring import tostring, escape
 
 
 class TestToString(SleekTest):
@@ -30,7 +30,7 @@ class TestToString(SleekTest):
     def testXMLEscape(self):
         """Test escaping XML special characters."""
         original = """<foo bar="baz">'Hi & welcome!'</foo>"""
-        escaped = xml_escape(original)
+        escaped = escape(original)
         desired = """&lt;foo bar=&quot;baz&quot;&gt;&apos;Hi"""
         desired += """ &amp; welcome!&apos;&lt;/foo&gt;"""
 
@@ -84,19 +84,6 @@ class TestToString(SleekTest):
         self.tryTostring(
             original='<a>foo <b>bar</b> baz</a>',
             message='Element tail content is incorrect.')
-
-
-    def testStanzaNs(self):
-        """
-        Test using the stanza_ns tostring parameter, which will prevent
-        adding an xmlns attribute to the serialized element if the
-        element's namespace is the same.
-        """
-        self.tryTostring(
-            original='<bar xmlns="foo" />',
-            expected='<bar />',
-            message="The stanza_ns parameter was not used properly.",
-            stanza_ns='foo')
 
     def testStanzaStr(self):
         """

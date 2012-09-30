@@ -134,17 +134,22 @@ class RosterItem(object):
                 'subscription': 'none',
                 'name': '',
                 'groups': []}
+
         self._db_state = {}
         self.load()
 
-    def set_backend(self, db=None):
+    def set_backend(self, db=None, save=True):
         """
         Set the datastore interface object for the roster item.
 
         Arguments:
-            db -- The new datastore interface.
+            db   -- The new datastore interface.
+            save -- If True, save the existing state to the new
+                    backend datastore. Defaults to True.
         """
         self.db = db
+        if save:
+            self.save()
         self.load()
 
     def load(self):
@@ -167,15 +172,24 @@ class RosterItem(object):
             return self._state
         return None
 
-    def save(self):
+    def save(self, remove=False):
         """
         Save the item's state information to an external datastore,
         if one has been provided.
+
+        Arguments:
+            remove -- If True, expunge the item from the datastore.
         """
         self['subscription'] = self._subscription()
+        if remove:
+            self._state['removed'] = True
         if self.db:
             self.db.save(self.owner, self.jid,
                          self._state, self._db_state)
+
+        # Finally, remove the in-memory copy if needed.
+        if remove:
+            del self.xmpp.roster[self.owner][self.jid]
 
     def __getitem__(self, key):
         """Return a state field's value."""
@@ -293,34 +307,29 @@ class RosterItem(object):
             p['from'] = self.owner
         p.send()
 
-    def send_presence(self, ptype=None, pshow=None, pstatus=None,
-                            ppriority=None, pnick=None):
+    def send_presence(self, **kwargs):
         """
         Create, initialize, and send a Presence stanza.
+
+        If no recipient is specified, send the presence immediately.
+        Otherwise, forward the send request to the recipient's roster
+        entry for processing.
 
         Arguments:
             pshow     -- The presence's show value.
             pstatus   -- The presence's status message.
             ppriority -- This connections' priority.
+            pto       -- The recipient of a directed presence.
+            pfrom     -- The sender of a directed presence, which should
+                         be the owner JID plus resource.
             ptype     -- The type of presence, such as 'subscribe'.
             pnick     -- Optional nickname of the presence's sender.
         """
-        p = self.xmpp.make_presence(pshow=pshow,
-                                    pstatus=pstatus,
-                                    ppriority=ppriority,
-                                    ptype=ptype,
-                                    pnick=pnick,
-                                    pto=self.jid)
-        if self.xmpp.is_component:
-            p['from'] = self.owner
-        if p['type'] in p.showtypes or \
-           p['type'] in ['available', 'unavailable']:
-            self.last_status = p
-        p.send()
-
-        if not self.xmpp.sentpresence:
-            self.xmpp.event('sent_presence')
-            self.xmpp.sentpresence = True
+        if self.xmpp.is_component and not kwargs.get('pfrom', ''):
+            kwargs['pfrom'] = self.owner
+        if not kwargs.get('pto', ''):
+            kwargs['pto'] = self.jid
+        self.xmpp.send_presence(**kwargs)
 
     def send_last_presence(self):
         if self.last_status is None:
@@ -342,13 +351,14 @@ class RosterItem(object):
         data = {'status': presence['status'],
                 'show': presence['show'],
                 'priority': presence['priority']}
-        if not self.resources:
-            self.xmpp.event('got_online', presence)
+        got_online = not self.resources
         if resource not in self.resources:
             self.resources[resource] = {}
         old_status = self.resources[resource].get('status', '')
         old_show = self.resources[resource].get('show', None)
         self.resources[resource].update(data)
+        if got_online:
+            self.xmpp.event('got_online', presence)
         if old_show != presence['show'] or old_status != presence['status']:
             self.xmpp.event('changed_status', presence)
 
@@ -482,3 +492,6 @@ class RosterItem(object):
         a roster reset request.
         """
         self.resources = {}
+
+    def __repr__(self):
+        return repr(self._state)
